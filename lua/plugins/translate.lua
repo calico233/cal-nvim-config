@@ -2,7 +2,7 @@ return {
 	"devilsakuya/nvim-translate",
 	opts = {
 		-- api_key = function ()
-		-- 	return "sk-jbgaubmotuyfmkszhvgydwshhiuotnboxfufvpiovpwllpop"
+		-- 	return ""
 		-- end,
 		-- base_url = "https://api.siliconflow.cn/v1",
 		-- model = "tencent/Hunyuan-MT-7B",
