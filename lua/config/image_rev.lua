@@ -1,0 +1,144 @@
+-- -- snacks.nvim：同名图片文件被替换后仍然显示旧内容的修复
+-- --
+-- -- 原因：
+-- --   * snacks 把图片转换后的 png 缓存按“路径的 sha256”命名（convert.lua 的 prefix），
+-- --     只要缓存文件还在，就跳过转换（step.done = fs_stat(file) ~= nil）；
+-- --   * 内存里还有一张 images[转换后文件] 的缓存表（image.lua），直接复用旧对象（旧 id、旧数据）；
+-- --   * doc/inline 的 placement 也只用 src 字符串做去重（inline.lua）。
+-- --   这三层都只看路径、不看文件内容，所以 A.jpg 被同名文件覆盖后一直是旧图，
+-- --   甚至重启 nvim 也没用（磁盘缓存里的旧 png 还在）。
+-- --
+-- -- 方案：
+-- --   通过 snacks 官方的 `image.resolve` 钩子，把图片路径换成“内容版本”的稳定软链：
+-- --   软链名 = hash(绝对路径 + mtime + size + inode)，放在 snacks 缓存目录的 rev/ 下。
+-- --   文件内容一变，路径就变，于是转换缓存 / 内存缓存 / placement 全部自动失效，
+-- --   走 snacks 本来就能正常工作的“新图片”流程。
+-- --
+-- --   软链的 stat 会跟随目标文件，所以 mtime/size/inode 变化都能感知到；
+-- --   文件没变时路径稳定，不会重复转换或闪烁。
+--
+-- local M = {}
+--
+-- local uv = vim.uv or vim.loop
+--
+-- ---@type table<string, {stamp: string, link: string}>
+-- local links = {}
+--
+-- --- 文件当前的内容版本（只 stat，不读内容）
+-- ---@param path string
+-- ---@return string?
+-- local function stamp(path)
+-- 	local st = uv.fs_stat(path)
+-- 	if not st then
+-- 		return nil
+-- 	end
+-- 	return table.concat({ st.mtime.sec, st.mtime.nsec, st.size, st.ino }, ".")
+-- end
+--
+-- --- 软链存放目录（跟 snacks 的缓存目录绑在一起，方便一起清理）
+-- ---@return string
+-- local function root()
+-- 	return (Snacks.image.config.cache or (vim.fn.stdpath("cache") .. "/snacks/image")) .. "/rev"
+-- end
+--
+-- --- 返回该文件当前内容对应的稳定路径
+-- ---@param path string
+-- ---@return string
+-- function M.rev(path)
+-- 	local st = stamp(path)
+-- 	if not st then
+-- 		return path
+-- 	end
+-- 	local hit = links[path]
+-- 	if hit and hit.stamp == st then
+-- 		return hit.link
+-- 	end
+-- 	local dir = root()
+-- 	local link = dir .. "/" .. vim.fn.sha256(path .. "|" .. st):sub(1, 16) .. "-" .. vim.fs.basename(path)
+-- 	if vim.fn.getftype(link) == "" then
+-- 		vim.fn.mkdir(dir, "p")
+-- 		if not pcall(uv.fs_symlink, path, link) then
+-- 			return path -- 建不了软链就退化为原来的行为
+-- 		end
+-- 	end
+-- 	links[path] = { stamp = st, link = link }
+-- 	return link
+-- end
+--
+-- --- 复刻 snacks 的路径解析（cwd / 当前文件目录 / img_dirs），并保留 #page= 后缀
+-- ---@param file string 当前 buffer 的文件名
+-- ---@param src string markdown 里写的路径（snacks 已做过 url decode）
+-- ---@return string?, string
+-- local function locate(file, src)
+-- 	if src == "" or src:find("^%w%w+://") then
+-- 		return nil, "" -- URL 交给 snacks 自己处理
+-- 	end
+-- 	local path, page = src:match("^(.-)(#page=.*)$")
+-- 	path, page = path or src, page or ""
+-- 	if path:sub(1, 1) == "~" then
+-- 		path = vim.fn.expand(path)
+-- 	end
+-- 	local dir = (file ~= "" and vim.fs.dirname(file)) or nil
+-- 	local candidates = { path }
+-- 	if path:sub(1, 1) ~= "/" then
+-- 		local cwd = uv.cwd() or "."
+-- 		candidates = { cwd .. "/" .. path, path }
+-- 		if dir and dir ~= "" then
+-- 			candidates[#candidates + 1] = dir .. "/" .. path
+-- 			for _, img_dir in ipairs(Snacks.image.config.img_dirs or {}) do
+-- 				candidates[#candidates + 1] = dir .. "/" .. img_dir .. "/" .. path
+-- 			end
+-- 		end
+-- 	end
+-- 	for _, candidate in ipairs(candidates) do
+-- 		if vim.fn.filereadable(candidate) == 1 then
+-- 			return vim.fs.normalize(candidate), page
+-- 		end
+-- 	end
+-- 	return nil, page
+-- end
+--
+-- --- snacks 的 `image.resolve` 钩子，返回 nil 时 snacks 会走自己的解析逻辑
+-- ---@param file string
+-- ---@param src string
+-- ---@return string?
+-- function M.resolve(file, src)
+-- 	local path, page = locate(file, src)
+-- 	if not path then
+-- 		return nil
+-- 	end
+-- 	return M.rev(path) .. page
+-- end
+--
+-- --- 让 snacks 重新扫描某个 buffer 的图片
+-- --- （snacks 的 inline 逻辑监听 WinScrolled，借它触发一次 update）
+-- ---@param buf? number
+-- function M.refresh(buf)
+-- 	buf = buf or vim.api.nvim_get_current_buf()
+-- 	if not vim.api.nvim_buf_is_valid(buf) then
+-- 		return
+-- 	end
+-- 	pcall(vim.api.nvim_exec_autocmds, "WinScrolled", { buffer = buf })
+-- end
+--
+-- function M.setup()
+-- 	local group = vim.api.nvim_create_augroup("config.image_rev", { clear = true })
+-- 	-- 从文件管理器回到终端、或切回某个 buffer 时，自动刷新一次
+-- 	vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter" }, {
+-- 		group = group,
+-- 		callback = function(ev)
+-- 			local buf = ev.buf
+-- 			if not vim.api.nvim_buf_is_valid(buf) then
+-- 				return
+-- 			end
+-- 			vim.defer_fn(function()
+-- 				M.refresh(buf)
+-- 			end, 50)
+-- 		end,
+-- 	})
+-- 	vim.api.nvim_create_user_command("ImageRefresh", function()
+-- 		M.refresh()
+-- 	end, { desc = "Reload snacks.nvim images in the current buffer" })
+-- end
+--
+-- return M

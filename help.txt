@@ -1,0 +1,191 @@
+用:=来执行lua代码，并把返回的结果打印到屏幕上, 比如 := vim.fn.stdpath('config') 结果为 "/home/cal/.config/nvim" 即 ~/.config/nvim
+:lua也能用来执行lua代码，但是不会直接打印结果
+
+在neovim内部打开一个文件的操作是用:edit filepath 或者直接 :e filepath
+
+想直接看到一个配置的效果可以在命令行直接输入, 比如 :lua vim.opt.number = true, 但这不是永久生效的，需要把他写到配置文件里
+
+<Cmd>并不是一个具体的按键，在normal mode下，<Cmd>是:
+						 ，在insert mode下，<Cmd>是<C-o>
+
+vim api:
+local currentLine = vim.fn.line('.') -- 获得当前行数
+local currentCol = vim.fn.col('^') -- 获得开头的列数，是0
+注意：当光标在第一列时，vim.fn.col('.')返回1，但其实把光标设置到0和1都是一样的效果
+
+
+local view = vim.fn.winsaveview() -- 保存当前视图，最后要恢复视图
+vim.fn.winrestview(view) -- 恢复原来视图
+
+local line = vim.fn.getline('.') -- 获取当前行的内容
+vim.cmd("normal! b") -- 执行normal模式下的b
+
+vim.cmd("startinsert") -- 回到插入模式
+
+
+vim.fn.cursor(line, col)-- 设置光标位置，字节列
+vim.fn.col('.') -- 获得当前的字节列数 所以这俩要搭配使用
+
+字节列，字符列，虚拟列：
+
+## 三种“列”的定义
+
+以 `hello世界` 为例，光标在 `世` 上：
+
+| 概念 | 值 | 说明 |
+|---|---|---|
+| **字节列** | 6 | `hello` 占 5 字节，`世` 从第 6 字节开始 |
+| **字符列** | 6 | 前面 5 个字符 + 自己，共 6 个字符 |
+| **虚拟列（显示列）** | 6 | `hello` 占 5 列，`世` 从第 6 列开始显示 |
+
+看起来一样？换个场景：光标在 `界` 上。
+
+| 概念 | 值 | 说明 |
+|---|---|---|
+| **字节列** | 9 | `hello` 5 字节 + `世` 3 字节 = 8，`界` 从第 9 字节开始 |
+| **字符列** | 7 | 前面 6 个字符 |
+| **虚拟列** | 8 | `hello` 5 列 + `世` 占 2 列 = 7，`界` 从第 8 列开始 |
+
+**三个值都不一样了。**
+
+---
+
+## 各 API 返回的是哪种
+
+| API | 返回类型 | 示例（光标在 `界`） |
+|---|---|---|
+| `vim.fn.col('.')` | 字节列 | 9 |
+| `vim.fn.virtcol('.')` | 虚拟列 | 8 |
+| `nvim_win_get_cursor(0)[2]` | 字节列（0-based） | 8 |
+| `vim.fn.strchars(前缀)` | 字符列 | 7 |
+
+**没有哪个 API 直接返回“字符列”**，需要自己用 `strchars()` 算。
+
+---
+
+## 什么时候用哪种
+
+### 1. 用 `vim.fn.cursor(行, 列)` 设置位置
+
+`cursor()` 的列参数是**字节列**，所以配合 `col('.')`：
+
+```lua
+local col = vim.fn.col('.')      -- 字节列
+vim.fn.cursor(vim.fn.line('.'), col)   -- 用字节列设置，一致
+```
+
+### 2. 用 `nvim_win_set_cursor` 设置位置
+
+它接受**字节列，0-based**：
+
+```lua
+local pos = vim.api.nvim_win_get_cursor(0)   -- {行, 字节列0-based}
+vim.api.nvim_win_set_cursor(0, {pos[1], pos[2]})   -- 保持一致
+```
+
+或者用 `col('.')` 转换：
+
+```lua
+local byte_col = vim.fn.col('.') - 1   -- 转成 0-based
+vim.api.nvim_win_set_cursor(0, {vim.fn.line('.'), byte_col})
+```
+
+### 3. 计算屏幕上的对齐、宽度
+
+用 `virtcol`：
+
+```lua
+local vcol = vim.fn.virtcol('.')
+local line_width = vim.fn.virtcol('$')   -- 整行的显示宽度
+```
+
+### 4. 统计“有多少个字”
+
+用 `strchars`：
+
+```lua
+local char_count = vim.fn.strchars(vim.fn.getline('.'))
+```
+
+---
+
+## 实际例子：你的 `C_Right` 函数
+
+你之前写过：
+
+```lua
+vim.fn.cursor(currentLine, math.max(vim.fn.col('$') - 1, 1))
+```
+
+`col('$')` 返回的是**行尾的字节列**（即字节数 + 1）。如果有中文：
+
+```text
+hello世界
+```
+
+- `col('$')` = 12（5 + 3 + 3 + 1 = 12）
+- 减 1 得 11，指向 `界` 的**第一个字节**
+
+`cursor(行, 11)` 会把光标放到 `界` 上，**行为正确**，因为 `cursor()` 用的是字节列。
+
+所以这里没问题。**只要 `col()` 和 `cursor()` 配对使用，中文不会出错**，因为它们用的是同一套字节列。
+
+---
+
+## 什么时候会出错
+
+### 错误 1：混用字节列和虚拟列
+
+```lua
+local vcol = vim.fn.virtcol('.')   -- 虚拟列，比如 8
+vim.fn.cursor(行, vcol)            -- cursor 期望字节列，但传了虚拟列
+```
+
+光标会跑到**错误的位置**，因为 8 是虚拟列，实际字节列是 9。
+
+### 错误 2：用 `#字符串` 当字节列
+
+Lua 的 `#` 在字符串上返回**字节数**，不是字符数：
+
+```lua
+local s = "世界"
+print(#s)   -- 6（字节数）
+print(vim.fn.strchars(s))   -- 2（字符数）
+```
+
+在纯 ASCII 下两者一样，有中文就错。
+
+### 错误 3：假设中文宽度是 1
+
+有些终端渲染中文占 2 列。如果你写“每行最多 N 列”这种逻辑，用字节数或字符数都会错，必须用 `virtcol`。
+
+---
+
+## 一张表总结
+
+| 场景 | 该用的 API | 返回 |
+|---|---|---|
+| 记录/恢复光标位置 | `col('.')` + `cursor()` | 字节列 |
+| 窗口 API 设置位置 | `nvim_win_set_cursor` + `nvim_win_get_cursor` | 字节列 0-based |
+| 屏幕对齐/宽度 | `virtcol()` | 虚拟列 |
+| 统计字数 | `strchars()` | 字符数 |
+| 字符串字节长度 | `#str` | 字节数 |
+
+---
+
+## 口诀
+
+- **`col` 配 `cursor`** —— 都用字节列，配对就安全。
+- **`virtcol` 管显示** —— 涉及屏幕宽度、对齐才用。
+- **`strchars` 管字数** —— 想要“几个字”用这个。
+- **永远别假设“一列等于一个字符”** —— 有中文时这三者全都不一样。
+
+只要遵循这个对应关系，中文、emoji、Tab 混合的行也不会算错列。
+
+
+
+
+
+
+
+
